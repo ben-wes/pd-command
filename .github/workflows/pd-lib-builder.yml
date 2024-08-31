@@ -8,6 +8,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  if: false # love this ... but i want to create pd64 builds
   pd-lib-builder:
+    if: false # love this ... but i want to create pd64 builds
     uses: pure-data/pure-data-ci/.github/workflows/pd-lib-builder.yml@main
