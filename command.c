@@ -148,12 +148,41 @@ static void command_exec(t_command *x, t_symbol *s, int ac, t_atom *at)
 
     char command_line[INBUFSIZE] = "";
     for (i = 0; i < ac; i++) {
+        if (i > 0) strcat(command_line, " ");
+        strcat(command_line, "\"");
         strcat(command_line, argv[i]);
-        if (i < ac - 1) strcat(command_line, " ");
+        strcat(command_line, "\"");
     }
 
-    if (!CreateProcess(NULL, command_line, NULL, NULL, TRUE, 0, NULL, x->path->s_name, &si, &x->pi)) {
-        pd_error(x, "command: failed to create process");
+    post("command: Attempting to execute: %s", command_line);
+    post("command: Working directory: %s", x->path->s_name);
+
+    BOOL result = CreateProcess(
+        NULL,                   // No module name (use command line)
+        command_line,           // Command line
+        NULL,                   // Process handle not inheritable
+        NULL,                   // Thread handle not inheritable
+        TRUE,                   // Set handle inheritance to TRUE
+        0,                      // No creation flags
+        NULL,                   // Use parent's environment block
+        NULL,                   // Use parent's starting directory 
+        &si,                    // Pointer to STARTUPINFO structure
+        &x->pi                  // Pointer to PROCESS_INFORMATION structure
+    );
+
+    if (!result) {
+        DWORD error = GetLastError();
+        char error_msg[1024];
+        FormatMessage(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL,
+            error,
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            error_msg,
+            1024,
+            NULL
+        );
+        pd_error(x, "command: failed to create process. Error %d: %s", error, error_msg);
         return;
     }
 
