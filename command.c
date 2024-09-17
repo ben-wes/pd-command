@@ -146,12 +146,11 @@ static void command_exec(t_command *x, t_symbol *s, int ac, t_atom *at)
     si.hStdOutput = x->stdout_pipe[1];
     si.hStdError = x->stderr_pipe[1];
 
-    char command_line[INBUFSIZE] = "";
+    char command_line[INBUFSIZE] = "C:\\Windows\\System32\\cmd.exe /c ";
     for (i = 0; i < ac; i++) {
-        if (i > 0) strcat(command_line, " ");
         strcat(command_line, "\"");
         strcat(command_line, argv[i]);
-        strcat(command_line, "\"");
+        strcat(command_line, "\" ");
     }
 
     post("command: Attempting to execute: %s", command_line);
@@ -163,9 +162,9 @@ static void command_exec(t_command *x, t_symbol *s, int ac, t_atom *at)
         NULL,                   // Process handle not inheritable
         NULL,                   // Thread handle not inheritable
         TRUE,                   // Set handle inheritance to TRUE
-        0,                      // No creation flags
+        CREATE_NO_WINDOW,       // Creation flags
         NULL,                   // Use parent's environment block
-        NULL,                   // Use parent's starting directory 
+        x->path->s_name,        // Use specified starting directory 
         &si,                    // Pointer to STARTUPINFO structure
         &x->pi                  // Pointer to PROCESS_INFORMATION structure
     );
