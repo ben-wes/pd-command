@@ -1,64 +1,38 @@
-/*
-Authors:
-    Guenter Geiger <geiger@epy.co.at>
-    Roman Haefeli <reduzent@gmail.com>
-*/
-
-/* this doesn't run on Windows (yet?) */
-#ifndef _WIN32
-
-#define _GNU_SOURCE
-
-#include <m_pd.h>
-
-#include <errno.h>
-#include <unistd.h>
-#include <stdlib.h>
+#include "m_pd.h"
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
-#include <poll.h>
-#include <sys/types.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
 #include <sys/wait.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
-#include <sched.h>
+#endif
 
-#define CLASSNAME "command"
-#define LIBVERSION "0.4"
 #define INBUFSIZE 65536
-
-void sys_rmpollfn(int fd);
-void sys_addpollfn(int fd, void* fn, void *ptr);
+#define MAX_ARGS 256
 
 static t_class *command_class;
-
-static void drop_priority(void)
-{
-#if (_POSIX_PRIORITY_SCHEDULING - 0) >=  200112L
-    struct sched_param par;
-    par.sched_priority = 0;
-    sched_setscheduler(0,SCHED_OTHER,&par);
-#endif
-}
-
-static const char*command_atom2string(const t_atom*ap, char*buffer, unsigned int buffersize) {
-  switch(ap->a_type) {
-  default:
-    atom_string(ap, buffer, buffersize);
-    return buffer;
-  case A_SYMBOL:
-    return strncat(buffer, atom_getsymbol(ap)->s_name, buffersize);
-  }
-  return 0;
-}
 
 typedef struct _command
 {
     t_object x_obj;
-    void* x_binbuf;
-    int fd_stdout_pipe[2];
-    int fd_stdin_pipe[2];
-    int fd_stderr_pipe[2];
-    int pid;
+#ifdef _WIN32
+    PROCESS_INFORMATION pi;
+    HANDLE stdin_pipe[2];
+    HANDLE stdout_pipe[2];
+    HANDLE stderr_pipe[2];
+#else
+    pid_t pid;
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+#endif
     int x_del;
     int x_bin;  // -b flag: binary output
     int x_sync; // -s flag: synchronous (blocking) mode of operation
@@ -69,359 +43,264 @@ typedef struct _command
     t_symbol *path;
 } t_command;
 
-void command_cleanup(t_command* x)
+static void command_read(t_command *x, int is_stderr)
 {
-    sys_rmpollfn(x->fd_stdout_pipe[0]);
-    sys_rmpollfn(x->fd_stderr_pipe[0]);
-
-    if (x->fd_stdout_pipe[0]>0) close(x->fd_stdout_pipe[0]);
-    if (x->fd_stdout_pipe[1]>0) close(x->fd_stdout_pipe[1]);
-    if (x->fd_stdin_pipe[0]>0) close(x->fd_stdin_pipe[0]);
-    if (x->fd_stdin_pipe[1]>0) close(x->fd_stdin_pipe[1]);
-    if (x->fd_stderr_pipe[0]>0) close(x->fd_stderr_pipe[0]);
-    if (x->fd_stderr_pipe[1]>0) close(x->fd_stderr_pipe[1]);
-
-    x->fd_stdout_pipe[0] = -1;
-    x->fd_stdout_pipe[1] = -1;
-    x->fd_stdin_pipe[0] = -1;
-    x->fd_stdin_pipe[1] = -1;
-    x->fd_stderr_pipe[0] = -1;
-    x->fd_stderr_pipe[1] = -1;
-    clock_unset(x->x_clock);
-}
-
-// snippet from pd's x_misc.c:fudiparse_binbufout
-static void command_doit(void *z, t_binbuf *b, t_outlet *outlet)
-{
-    t_command *x = (t_command *)z;
-    int msg, natom = binbuf_getnatom(b);
-    t_atom *at = binbuf_getvec(b);
-
-    for (msg = 0; msg < natom;)
-    {
-        int emsg;
-        for (emsg = msg; emsg < natom && at[emsg].a_type != A_COMMA
-            && at[emsg].a_type != A_SEMI; emsg++);
-
-        if (emsg > msg)
-        {
-            int i;
-            for (i = msg; i < emsg; i++)
-	    	if (at[i].a_type == A_DOLLAR || at[i].a_type == A_DOLLSYM)
-            {
-                pd_error(x, "[%s]: got dollar sign in message", CLASSNAME);
-                goto nodice;
-            }
-            if (at[msg].a_type == A_FLOAT)
-            {
-                if (emsg > msg + 1)
-                    outlet_list(outlet,  0, emsg-msg, at + msg);
-                else outlet_float(outlet,  at[msg].a_w.w_float);
-            }
-	    else if (at[msg].a_type == A_SYMBOL)
-                outlet_anything(outlet,  at[msg].a_w.w_symbol,
-                    emsg-msg-1, at + msg + 1);
-        }
-    nodice:
-        msg = emsg + 1;
-    }
-}
-
-void command_read(t_command *x, int fd)
-{
-    // text output mode
-    if (x->x_bin == 0) {
-        char buf[INBUFSIZE];
-        t_binbuf* bbuf = binbuf_new();
-        int i;
-        int ret;
-
-        ret = read(fd, buf,INBUFSIZE-1);
-        buf[ret] = '\0';
-
-        for (i=0;i<ret;i++)
-            if (buf[i] == '\n') buf[i] = ';';
-        if (buf[i] == 'M') buf[i] = 'X';
-        if (ret < 0)
-        {
-            pd_error(x, "[%s]: pipe read error", CLASSNAME);
-            sys_rmpollfn(fd);
-            x->fd_stdout_pipe[0] = -1;
-            close(fd);
-            return;
-        }
-        else if (ret == 0)
-        {
-            pd_error(x, "[%s]: EOF on socket %d\n", CLASSNAME, fd);
-            sys_rmpollfn(fd);
-            x->fd_stdout_pipe[0] = -1;
-            close(fd);
-            return;
-        }
-        else
-        {
-            binbuf_text(bbuf, buf, strlen(buf));
-            if (fd == x->fd_stdout_pipe[0])
-            {
-                command_doit(x,bbuf,x->x_stdout);
-            }
-            else if (fd == x->fd_stderr_pipe[0])
-            {
-                command_doit(x,bbuf,x->x_stderr);
-            }
-        }
-        binbuf_free(bbuf);
-    }
-    // binary output mode
-    else {
-        char buf[INBUFSIZE];
-        int outc, n;
-        outc = read(fd, buf,INBUFSIZE-1);
-        t_atom *outv = (t_atom *)getbytes(outc * sizeof(t_atom));
-        for (n = 0; n < outc; n++)
-            SETFLOAT(outv + n, (unsigned char)buf[n]);
-        if (fd == x->fd_stdout_pipe[0])
-            outlet_list(x->x_stdout, &s_list, outc, outv);
-        if (fd == x->fd_stderr_pipe[0])
-            outlet_list(x->x_stderr, &s_list, outc, outv);
-        freebytes(outv, outc * sizeof(t_atom));
-    }
-}
-
-void command_check(t_command* x)
-{
+    char buf[INBUFSIZE];
     int ret;
-    int status;
-    int retval = 0;
-    ret = waitpid(x->pid,&status,WNOHANG);
-    if (ret == x->pid) {
-        if(poll(&(struct pollfd){ .fd = x->fd_stdout_pipe[0], .events = POLLIN }, 1, 0)==1)  {
-            command_read(x, x->fd_stdout_pipe[0]);
+
+#ifdef _WIN32
+    DWORD bytes_read;
+    BOOL success = ReadFile(is_stderr ? x->stderr_pipe[0] : x->stdout_pipe[0], 
+                            buf, INBUFSIZE - 1, &bytes_read, NULL);
+    ret = success ? bytes_read : -1;
+#else
+    ret = read(is_stderr ? x->stderr_pipe[0] : x->stdout_pipe[0], buf, INBUFSIZE - 1);
+#endif
+
+    if (ret > 0) {
+        buf[ret] = '\0';
+        if (x->x_bin) {
+            // Binary mode: output as list of floats
+            t_atom *outv = (t_atom *)getbytes(ret * sizeof(t_atom));
+            for (int i = 0; i < ret; i++) {
+                SETFLOAT(outv + i, (t_float)(unsigned char)buf[i]);
+            }
+            outlet_list(is_stderr ? x->x_stderr : x->x_stdout, &s_list, ret, outv);
+            freebytes(outv, ret * sizeof(t_atom));
+        } else {
+            // Text mode: output as symbol
+            outlet_symbol(is_stderr ? x->x_stderr : x->x_stdout, gensym(buf));
         }
-        if(poll(&(struct pollfd){ .fd = x->fd_stderr_pipe[0], .events = POLLIN }, 1, 0)==1)  {
-            command_read(x, x->fd_stderr_pipe[0]);
-        }
-        if (WIFEXITED(status))
-            retval = WEXITSTATUS(status);
-        command_cleanup(x);
-        outlet_float(x->x_done, retval);
-    }
-    else {
-        if (x->x_del < 100) x->x_del+=2; /* increment poll times */
-        clock_delay(x->x_clock,x->x_del);
     }
 }
 
-static void command_send(t_command *x, t_symbol *s,int ac, t_atom *at)
+static void command_check(t_command *x)
 {
-    int i;
-    char tmp[MAXPDSTRING];
-    int size = 0;
-    (void)s;    //suppress warning
-
-    if (x->fd_stdin_pipe[0] == -1) return; /* nothing to send to */
-
-    for (i=0;i<ac;i++) {
-        tmp[size]=0;
-        command_atom2string(at, tmp+size, MAXPDSTRING-size);
-        at++;
-        size=strlen(tmp);
-        tmp[size++] = ' ';
-    }
-    tmp[size-1] = 0;
-    if (write(x->fd_stdin_pipe[1],tmp,strlen(tmp)) == -1)
-    {
-        pd_error(x, "[%s]: writing to stdin of command failed", CLASSNAME);
-    }
-}
-
-static void command_env(t_command *x, t_symbol *var, t_symbol *val)
-{
-    if(setenv(var->s_name, val->s_name, 1) < 0)
-    {
-        pd_error(x, "[%s]: setting environment variable failed. errno: %d", CLASSNAME, errno);
+#ifdef _WIN32
+    DWORD exit_code;
+    if (GetExitCodeProcess(x->pi.hProcess, &exit_code) && exit_code != STILL_ACTIVE) {
+        command_read(x, 0);  // Read remaining stdout
+        command_read(x, 1);  // Read remaining stderr
+        CloseHandle(x->pi.hProcess);
+        CloseHandle(x->pi.hThread);
+        CloseHandle(x->stdin_pipe[0]);
+        CloseHandle(x->stdin_pipe[1]);
+        CloseHandle(x->stdout_pipe[0]);
+        CloseHandle(x->stdout_pipe[1]);
+        CloseHandle(x->stderr_pipe[0]);
+        CloseHandle(x->stderr_pipe[1]);
+        outlet_float(x->x_done, (t_float)exit_code);
     } else {
-        logpost(x, 3, "[%s]: setting %s=%s", CLASSNAME, var->s_name, val->s_name);
+        if (x->x_del < 100) x->x_del += 2;
+        clock_delay(x->x_clock, x->x_del);
     }
+#else
+    int status;
+    pid_t result = waitpid(x->pid, &status, WNOHANG);
+    if (result == x->pid) {
+        command_read(x, 0);  // Read remaining stdout
+        command_read(x, 1);  // Read remaining stderr
+        close(x->stdin_pipe[0]);
+        close(x->stdin_pipe[1]);
+        close(x->stdout_pipe[0]);
+        close(x->stdout_pipe[1]);
+        close(x->stderr_pipe[0]);
+        close(x->stderr_pipe[1]);
+        outlet_float(x->x_done, (t_float)WEXITSTATUS(status));
+    } else if (result == 0) {
+        if (x->x_del < 100) x->x_del += 2;
+        clock_delay(x->x_clock, x->x_del);
+    } else {
+        pd_error(x, "command: waitpid() failed");
+    }
+#endif
 }
 
 static void command_exec(t_command *x, t_symbol *s, int ac, t_atom *at)
 {
+    char *argv[MAX_ARGS];
     int i;
-    (void)s; // suppress warning
 
-    if (x->fd_stdout_pipe[0] != -1) {
-        pd_error(x, "[%s]: old process still running", CLASSNAME);
+    if (ac > MAX_ARGS - 1) {
+        pd_error(x, "command: too many arguments");
         return;
     }
 
-    if (pipe(x->fd_stdin_pipe) == -1) {
-        pd_error(x, "[%s]: unable to create stdin pipe", CLASSNAME);
+    for (i = 0; i < ac; i++) {
+        argv[i] = atom_getsymbol(at + i)->s_name;
+    }
+    argv[i] = NULL;
+
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+    if (!CreatePipe(&x->stdin_pipe[0], &x->stdin_pipe[1], &sa, 0) ||
+        !CreatePipe(&x->stdout_pipe[0], &x->stdout_pipe[1], &sa, 0) ||
+        !CreatePipe(&x->stderr_pipe[0], &x->stderr_pipe[1], &sa, 0)) {
+        pd_error(x, "command: failed to create pipes");
         return;
     }
 
-    if (pipe(x->fd_stdout_pipe) == -1) {
-	pd_error(x, "[%s]: unable to create stdout pipe", CLASSNAME);
+    STARTUPINFO si = {sizeof(STARTUPINFO)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = x->stdin_pipe[0];
+    si.hStdOutput = x->stdout_pipe[1];
+    si.hStdError = x->stderr_pipe[1];
+
+    char command_line[INBUFSIZE] = "";
+    for (i = 0; i < ac; i++) {
+        strcat(command_line, argv[i]);
+        if (i < ac - 1) strcat(command_line, " ");
+    }
+
+    if (!CreateProcess(NULL, command_line, NULL, NULL, TRUE, 0, NULL, x->path->s_name, &si, &x->pi)) {
+        pd_error(x, "command: failed to create process");
         return;
     }
 
-    if (pipe(x->fd_stderr_pipe) == -1) {
-	pd_error(x, "[%s]: unable to create stderr pipe", CLASSNAME);
+    CloseHandle(x->stdin_pipe[0]);
+    CloseHandle(x->stdout_pipe[1]);
+    CloseHandle(x->stderr_pipe[1]);
+#else
+    if (pipe(x->stdin_pipe) == -1 || pipe(x->stdout_pipe) == -1 || pipe(x->stderr_pipe) == -1) {
+        pd_error(x, "command: failed to create pipes");
         return;
     }
 
-    sys_addpollfn(x->fd_stdout_pipe[0],command_read,x);
-    sys_addpollfn(x->fd_stderr_pipe[0],command_read,x);
     x->pid = fork();
+    if (x->pid == -1) {
+        pd_error(x, "command: fork failed");
+        return;
+    } else if (x->pid == 0) {
+        // Child process
+        dup2(x->stdin_pipe[0], STDIN_FILENO);
+        dup2(x->stdout_pipe[1], STDOUT_FILENO);
+        dup2(x->stderr_pipe[1], STDERR_FILENO);
+        
+        close(x->stdin_pipe[0]);
+        close(x->stdin_pipe[1]);
+        close(x->stdout_pipe[0]);
+        close(x->stdout_pipe[1]);
+        close(x->stderr_pipe[0]);
+        close(x->stderr_pipe[1]);
 
-    if (x->pid == 0) {
-        char**argv = getbytes((ac + 1) * sizeof(char*));
-        /* reassign stdout */
-        dup2(x->fd_stdin_pipe[0],  STDIN_FILENO);
-        dup2(x->fd_stdout_pipe[1], STDOUT_FILENO);
-        dup2(x->fd_stderr_pipe[1], STDERR_FILENO);
-        close(x->fd_stdin_pipe[0]);
-        close(x->fd_stdout_pipe[1]);
-        close(x->fd_stderr_pipe[1]);
-
-        /* drop privileges */
-        drop_priority();
-        /* lose setuid priveliges */
-        if (seteuid(getuid()) == -1)
-        {
-            pd_error(x, "[%s]: seteuid failed", CLASSNAME);
-            return;
-        }
-        for (i=0;i<ac;i++) {
-	    argv[i] = getbytes(MAXPDSTRING);
-	    command_atom2string(at, argv[i], MAXPDSTRING);
-	    at++;
-	}
-	argv[i] = 0;
         if (chdir(x->path->s_name) == -1) {
-            pd_error(x, "changing directory failed");
+            pd_error(x, "command: chdir failed");
+            exit(1);
         }
 
-	if (execvp(argv[0], argv) == -1) {
-            pd_error(x, "execution failed");
-        };
-
-        for (i=0;i<ac;i++) {
-            freebytes(argv[i], MAXPDSTRING);
-        }
-        freebytes(argv, (ac+1) * sizeof(char*));
-
-	exit(errno);
+        execvp(argv[0], argv);
+        pd_error(x, "command: exec failed");
+        exit(1);
+    } else {
+        // Parent process
+        close(x->stdin_pipe[0]);
+        close(x->stdout_pipe[1]);
+        close(x->stderr_pipe[1]);
     }
-    // should we wait for command to return (blocking mode / -s) or
-    // should we schedule a check for later (non-blocking mode)?
-    if (x->x_sync)
-    {
-        int status;
-        int retval = -1;
-        waitpid(x->pid, &status, 0);
-        if(poll(&(struct pollfd){ .fd = x->fd_stdout_pipe[0], .events = POLLIN }, 1, 0)==1)  {
-            command_read(x, x->fd_stdout_pipe[0]);
+#endif
+
+    if (x->x_sync) {
+        while (1) {
+            command_check(x);
+#ifdef _WIN32
+            DWORD exit_code;
+            if (GetExitCodeProcess(x->pi.hProcess, &exit_code) && exit_code != STILL_ACTIVE) {
+                break;
+            }
+#else
+            int status;
+            if (waitpid(x->pid, &status, WNOHANG) == x->pid) {
+                break;
+            }
+#endif
         }
-        if(poll(&(struct pollfd){ .fd = x->fd_stderr_pipe[0], .events = POLLIN }, 1, 0)==1)  {
-            command_read(x, x->fd_stderr_pipe[0]);
-        }
-        if (WIFEXITED(status))
-            retval = WEXITSTATUS(status);
-        command_cleanup(x);
-        outlet_float(x->x_done, retval);
     } else {
         x->x_del = 4;
-        clock_delay(x->x_clock,x->x_del);
+        clock_delay(x->x_clock, x->x_del);
     }
 }
 
-void command_free(t_command* x)
+static void command_send(t_command *x, t_symbol *s, int ac, t_atom *at)
 {
-    if (x->fd_stdout_pipe[0] != -1)
-    {
-        if (kill(x->pid, SIGINT) < -1)
-        {
-            pd_error(x, "[%s]: killing command failed", CLASSNAME);
+    char buf[INBUFSIZE];
+    int len = 0;
+    
+    for (int i = 0; i < ac && len < INBUFSIZE - 1; i++) {
+        atom_string(at + i, buf + len, INBUFSIZE - len - 1);
+        len += strlen(buf + len);
+        if (i < ac - 1 && len < INBUFSIZE - 1) {
+            buf[len++] = ' ';
         }
-        command_cleanup(x);
     }
-    binbuf_free(x->x_binbuf);
+    
+    if (len > 0) {
+#ifdef _WIN32
+        DWORD bytes_written;
+        WriteFile(x->stdin_pipe[1], buf, len, &bytes_written, NULL);
+#else
+        write(x->stdin_pipe[1], buf, len);
+#endif
+    }
 }
 
-void command_kill(t_command *x)
+static void command_kill(t_command *x)
 {
-    if (x->fd_stdin_pipe[0] == -1) return;
-    if (kill(x->pid, SIGINT) < -1)
-    {
-        pd_error(x, "[%s]: killing command failed", CLASSNAME);
+#ifdef _WIN32
+    if (x->pi.hProcess) {
+        TerminateProcess(x->pi.hProcess, 1);
     }
+#else
+    if (x->pid > 0) {
+        kill(x->pid, SIGTERM);
+    }
+#endif
 }
 
 static void *command_new(t_symbol *s, int argc, t_atom *argv)
 {
     t_command *x = (t_command *)pd_new(command_class);
-    (void)s->s_name;
-
-    x->fd_stdout_pipe[0] = -1; // read end
-    x->fd_stdout_pipe[1] = -1; // write end
-    x->fd_stdin_pipe[0] = -1;  // read end
-    x->fd_stdin_pipe[1] = -1;  // write end
-
-    x->x_binbuf = binbuf_new();
-
+    
     x->x_done = outlet_new(&x->x_obj, &s_float);
-    x->x_stdout = outlet_new(&x->x_obj, 0);
-    x->x_stderr = outlet_new(&x->x_obj, 0);
-    x->x_clock = clock_new(x, (t_method) command_check);
+    x->x_stdout = outlet_new(&x->x_obj, &s_anything);
+    x->x_stderr = outlet_new(&x->x_obj, &s_anything);
+    x->x_clock = clock_new(x, (t_method)command_check);
     x->path = canvas_getdir(canvas_getcurrent());
+    x->x_bin = 0;
+    x->x_sync = 0;
 
-    // check for -b flag (binary output)
-    // and for -s flag (synchron mode)
-    // snippet from Pd's x_net.c
-    if (argc && argv->a_type == A_FLOAT)
-    {
-        x->x_bin = 0;
-        x->x_sync = 0;
-        argc = 0;
-    }
-    else while (argc && argv->a_type == A_SYMBOL &&
-        *argv->a_w.w_symbol->s_name == '-')
-    {
-        if (!strcmp(argv->a_w.w_symbol->s_name, "-b"))
-        {
+#ifdef _WIN32
+    x->pi.hProcess = NULL;
+#else
+    x->pid = -1;
+#endif
+
+    // Parse flags
+    while (argc > 0 && argv->a_type == A_SYMBOL && *argv->a_w.w_symbol->s_name == '-') {
+        if (strcmp(argv->a_w.w_symbol->s_name, "-b") == 0) {
             x->x_bin = 1;
-        } else if (!strcmp(argv->a_w.w_symbol->s_name, "-s"))
-        {
+        } else if (strcmp(argv->a_w.w_symbol->s_name, "-s") == 0) {
             x->x_sync = 1;
         }
-        else
-        {
-            pd_error(x, "[%s]: unknown flag", CLASSNAME);
-            postatom(argc, argv); endpost();
-        }
-        argc--; argv++;
+        argc--;
+        argv++;
     }
-    if (argc)
-    {
-        pd_error(x, "[%s]: extra arguments ignored", CLASSNAME);
-        postatom(argc, argv); endpost();
-    }
+
     return (x);
+}
+
+static void command_free(t_command *x)
+{
+    command_kill(x);
+    clock_free(x->x_clock);
 }
 
 void command_setup(void)
 {
     command_class = class_new(gensym("command"), (t_newmethod)command_new,
-                        (t_method)command_free,sizeof(t_command), 0, A_GIMME, 0);
-    class_addmethod(command_class, (t_method)command_env, gensym("env"),
-        A_SYMBOL, A_SYMBOL, 0);
+                        (t_method)command_free, sizeof(t_command), 0, A_GIMME, 0);
     class_addmethod(command_class, (t_method)command_exec, gensym("exec"),
         A_GIMME, 0);
     class_addmethod(command_class, (t_method)command_kill, gensym("kill"), 0);
     class_addmethod(command_class, (t_method)command_send, gensym("send"),
         A_GIMME, 0);
-    logpost(NULL, 2, "[%s]: version %s", CLASSNAME, LIBVERSION);
 }
-
-#endif /* _WIN32 */
