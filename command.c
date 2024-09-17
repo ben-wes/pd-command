@@ -146,23 +146,23 @@ static void command_exec(t_command *x, t_symbol *s, int ac, t_atom *at)
     si.hStdOutput = x->stdout_pipe[1];
     si.hStdError = x->stderr_pipe[1];
 
-    char command_line[INBUFSIZE] = "C:\\Windows\\System32\\cmd.exe /c ";
+    char powershell_command[INBUFSIZE] = "powershell.exe -NoProfile -NonInteractive -Command \"& {";
     for (i = 0; i < ac; i++) {
-        strcat(command_line, "\"");
-        strcat(command_line, argv[i]);
-        strcat(command_line, "\" ");
+        if (i > 0) strcat(powershell_command, " ");
+        strcat(powershell_command, argv[i]);
     }
+    strcat(powershell_command, "}\"");
 
-    post("command: Attempting to execute: %s", command_line);
+    post("command: Attempting to execute: %s", powershell_command);
     post("command: Working directory: %s", x->path->s_name);
 
     BOOL result = CreateProcess(
         NULL,                   // No module name (use command line)
-        command_line,           // Command line
+        powershell_command,     // Command line
         NULL,                   // Process handle not inheritable
         NULL,                   // Thread handle not inheritable
         TRUE,                   // Set handle inheritance to TRUE
-        CREATE_NO_WINDOW,       // Creation flags
+        0,                      // No creation flags
         NULL,                   // Use parent's environment block
         x->path->s_name,        // Use specified starting directory 
         &si,                    // Pointer to STARTUPINFO structure
